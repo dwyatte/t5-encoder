@@ -1,5 +1,4 @@
 import setuptools
-import t5_encoder
 
 with open("README.md", "r") as fh:
     long_description = fh.read()
@@ -7,7 +6,7 @@ with open("README.md", "r") as fh:
 setuptools.setup(
     name="t5_encoder",
     author="Oscar Sainz",
-    version=t5_encoder.__version__,
+    version="0.1",
     author_email="oscar.sainz@ehu.eus",
     description="A extension of Transformers library to include T5ForSequenceClassification class.",
     long_description=long_description,

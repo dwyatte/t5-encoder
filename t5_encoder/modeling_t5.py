@@ -5,6 +5,7 @@ from torch import nn
 from torch.utils import checkpoint
 
 from transformers.models.t5.modeling_t5 import (
+    T5EncoderModel,
     T5PreTrainedModel,
     T5Config,
     T5Stack,
@@ -28,7 +29,7 @@ from transformers.utils.model_parallel_utils import assert_device_map, get_devic
 @add_start_docstrings(
     """T5 Model with a token classification head on top (a linear layer on top of the hidden-states output) e.g. for
     Named-Entity-Recognition (NER) tasks.
-    """, 
+    """,
     T5_START_DOCSTRING
 )
 class T5ForTokenClassification(T5PreTrainedModel):
@@ -153,25 +154,26 @@ class T5ForTokenClassification(T5PreTrainedModel):
 
 @add_start_docstrings(
     """T5 Model with a sequence classification head on top (a linear layer on top of the <eos> token).
-    """, 
+    """,
     T5_START_DOCSTRING
 )
 class T5ForSequenceClassification(T5PreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"encoder.embed_tokens.weight"]
 
     def __init__(self, config: T5Config):
         super().__init__(config)
-        self.model_dim = config.d_model
-        self.config.problem_type = None
-        self.config.is_encoder_decoder = False
+        self.encoder = T5EncoderModel.from_pretrained(config._name_or_path)
 
-        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        # Initialize weights and apply final processing
+        self.post_init()
 
-        encoder_config = copy.deepcopy(config)
-        encoder_config.is_decoder = False
-        encoder_config.is_encoder_decoder = False
-        encoder_config.use_cache = False
-        self.encoder = T5Stack(encoder_config, self.shared)
+        decoder_config = copy.deepcopy(config)
+        decoder_config.is_decoder = True
+        decoder_config.is_encoder_decoder = False
+        decoder_config.num_layers = 1
+        decoder_config.vocab_size = 1
+
+        self.decoder_embedding = nn.Embedding(decoder_config.vocab_size, config.d_model)
+        self.decoder = T5Stack(decoder_config, self.decoder_embedding)
 
         classifier_dropout = (
             config.classifier_dropout if hasattr(config, 'classifier_dropout') else config.dropout_rate
@@ -179,12 +181,14 @@ class T5ForSequenceClassification(T5PreTrainedModel):
         self.dropout = nn.Dropout(classifier_dropout)
         self.classifier = nn.Linear(config.d_model, config.num_labels)
 
-        # Initialize weights and apply final processing
-        self.post_init()
-
         # Model parallel
         self.model_parallel = False
         self.device_map = None
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        kwargs["ignore_mismatched_sizes"] = True
+        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
 
     @add_start_docstrings(PARALLELIZE_DOCSTRING)
     def parallelize(self, device_map=None):
@@ -206,13 +210,6 @@ class T5ForSequenceClassification(T5PreTrainedModel):
         self.model_parallel = False
         self.device_map = None
         torch.cuda.empty_cache()
-
-    def get_input_embeddings(self):
-        return self.shared
-
-    def set_input_embeddings(self, new_embeddings):
-        self.shared = new_embeddings
-        self.encoder.set_input_embeddings(new_embeddings)
 
     def get_encoder(self):
         return self.encoder
@@ -247,7 +244,7 @@ class T5ForSequenceClassification(T5PreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.encoder(
+        encoder_outputs = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
@@ -257,14 +254,16 @@ class T5ForSequenceClassification(T5PreTrainedModel):
             return_dict=return_dict,
         )
 
-        # Get last hidden indices
-        # (batch_size) -> (batch_size, 1) -> (batch_size, hidden_size) -> (batch_size, 1, hidden_size)
-        last_hidden_indices = (
-            (input_ids != self.config.pad_token_id).sum(dim=-1) - 1
-        ).unsqueeze(dim=-1).repeat(1, outputs[0].size(-1)).unsqueeze(1) 
-        sequence_output = outputs[0].gather(dim=1, index=last_hidden_indices).squeeze(1)
+        decoder_inputs = dict(
+            input_ids=torch.zeros_like(input_ids)[:, 0:1],
+            attention_mask=torch.ones((input_ids.shape[0], 1, 1)),
+            encoder_attention_mask=attention_mask,
+            encoder_hidden_states=encoder_outputs.last_hidden_state
+        )
+        decoder_outputs = self.decoder(**decoder_inputs).last_hidden_state
+        classifier_input = torch.squeeze(decoder_outputs)
 
-        sequence_output = self.dropout(sequence_output)
+        sequence_output = self.dropout(classifier_input)
         logits = self.classifier(sequence_output)
 
         loss = None
@@ -291,12 +290,12 @@ class T5ForSequenceClassification(T5PreTrainedModel):
                 loss = loss_fct(logits, labels)
 
         if not return_dict:
-            output = (logits,) + outputs[2:]
+            output = (logits,) + encoder_outputs[2:]
             return ((loss,) + output) if loss is not None else output
 
         return SequenceClassifierOutput(
             loss=loss,
             logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions
         )
