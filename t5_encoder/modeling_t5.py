@@ -163,9 +163,6 @@ class T5ForSequenceClassification(T5PreTrainedModel):
         super().__init__(config)
         self.encoder = T5EncoderModel.from_pretrained(config._name_or_path)
 
-        # Initialize weights and apply final processing
-        self.post_init()
-
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
@@ -180,6 +177,9 @@ class T5ForSequenceClassification(T5PreTrainedModel):
         )
         self.dropout = nn.Dropout(classifier_dropout)
         self.classifier = nn.Linear(config.d_model, config.num_labels)
+
+        # Initialize weights and apply final processing
+        self.post_init()
 
         # Model parallel
         self.model_parallel = False
@@ -199,6 +199,7 @@ class T5ForSequenceClassification(T5PreTrainedModel):
         )
         assert_device_map(self.device_map, len(self.encoder.block))
         self.encoder.parallelize(self.device_map)
+        self.decoder.to(self.encoder.first_device)
         self.classifier.to(self.encoder.first_device)
         self.model_parallel = True
 
